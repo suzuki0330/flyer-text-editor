@@ -212,7 +212,8 @@ let selectedBlock = null;
 let scale = 1;
 let ocrDone = false;        // テスト用フラグ
 
-const FONT_STACK = '"Yu Gothic", "Hiragino Sans", "Meiryo", sans-serif';
+// チラシで多用される丸ゴシック体を優先（無ければ通常のゴシックへフォールバック）
+const FONT_STACK = '"HG丸ｺﾞｼｯｸM-PRO", "HGMaruGothicMPRO", "Hiragino Maru Gothic ProN", "Yu Gothic", "Meiryo", sans-serif';
 
 // ---------- ファイル読み込み ----------
 dropZone.addEventListener("click", () => fileInput.click());
@@ -319,28 +320,33 @@ async function startEditing() {
       const words = trimGarbageWords(rawWords);
       if (!words.length) { dbg.result = "all-garbage"; continue; }
 
-      const t = cleanText(joinWords(words));
+      const t = stripEdgeSymbols(cleanText(joinWords(words)));
       const conf = words.reduce((s, x) => s + x.conf, 0) / words.length;
-      const b = {
+      const union = {
         x0: Math.min(...words.map(x => x.bbox.x0)),
         y0: Math.min(...words.map(x => x.bbox.y0)),
         x1: Math.max(...words.map(x => x.bbox.x1)),
         y1: Math.max(...words.map(x => x.bbox.y1))
       };
-      dbg.text = t; dbg.conf = Math.round(conf); dbg.bbox = b;
-
-      const bh = b.y1 - b.y0;
       if (!t) { dbg.result = "empty"; continue; }
-      if (bh < 8 || bh > h * 0.25) { dbg.result = "height"; continue; }
+
+      // OCRのbboxではなく、実際に文字が描かれている範囲に合わせる
+      const ink = measureInk(fullImg, union);
+      if (!ink) { dbg.result = "no-ink"; continue; }
+      const b = { x0: ink.x0 - 2, y0: ink.y0 - 2, x1: ink.x1 + 2, y1: ink.y1 + 2 };
+      dbg.text = t; dbg.conf = Math.round(conf); dbg.bbox = b;
+      dbg.inkH = ink.h; dbg.inkRatio = +ink.ratio.toFixed(2);
+
+      if (ink.h < 8 || ink.h > h * 0.25) { dbg.result = "height"; continue; }
       if (b.x1 - b.x0 > w * 0.98) { dbg.result = "width"; continue; }
       if (!looksLikeText(t, conf)) { dbg.result = "garbage"; continue; }
       if (!isFlatBackground(fullImg, b)) { dbg.result = "photo-bg"; skipped++; continue; }
       dbg.result = "ok";
-      cands.push({ b, t, conf, medianH: median(words.map(x => x.bbox.y1 - x.bbox.y0)), dbg });
+      cands.push({ b, t, conf, inkH: ink.h, bold: ink.ratio > 0.3, dbg });
     }
 
     // 小さい文字の行は3倍に拡大して読み直し、信頼度が上がった場合だけ差し替える（誤字対策）
-    const small = cands.filter(c => c.medianH < 28);
+    const small = cands.filter(c => c.inkH < 24);
     if (small.length) {
       await worker.setParameters({ tessedit_pageseg_mode: "7" });
       let done = 0;
@@ -348,7 +354,7 @@ async function startEditing() {
         setStatus(`小さい文字を読み直して精度を上げています… (${++done}/${small.length})`);
         try {
           const r = await worker.recognize(makeRefineCrop(c.b));
-          const rt = cleanText((r.data.text || "").trim());
+          const rt = stripEdgeSymbols(cleanText((r.data.text || "").trim()));
           if (rt && r.data.confidence > c.conf) {
             c.dbg.refined = `${rt} (${Math.round(r.data.confidence)})`;
             c.t = rt;
@@ -360,10 +366,10 @@ async function startEditing() {
 
     for (const c of cands) {
       const b = c.b;
-      // 文字サイズは「実際の文字の高さ（単語高さの中央値）」から決め、
+      // 文字サイズは実測したインクの高さから決め、
       // 元の幅に収まらなければ自動で縮める
-      let size = Math.max(8, Math.round(Math.min(c.medianH, b.y1 - b.y0) * 0.95));
-      size = fitSizeToWidth(c.t, size, b.x1 - b.x0);
+      let size = Math.max(8, Math.round(c.inkH * 1.05));
+      size = fitSizeToWidth(c.t, size, b.x1 - b.x0, c.bold);
       const color = detectTextColor(b);
       const rect = eraseRegion(ectx, b);
       createBlock({
@@ -371,7 +377,7 @@ async function startEditing() {
         y: b.y0,
         size: size,
         color: color,
-        bold: false,
+        bold: c.bold,
         text: c.t,
         rect: rect
       });
@@ -414,7 +420,7 @@ function makeOcrCanvas(scale) {
 
 // 1行ぶんの領域を3倍に拡大して二値化したcrop（小さい文字の読み直し用）
 function makeRefineCrop(b) {
-  const pad = 4, s = 3;
+  const pad = 8, s = 3;
   const x0 = Math.max(0, b.x0 - pad), y0 = Math.max(0, b.y0 - pad);
   const cw = Math.min(baseCanvas.width, b.x1 + pad) - x0;
   const ch = Math.min(baseCanvas.height, b.y1 + pad) - y0;
@@ -508,13 +514,26 @@ function trimGarbageWords(words) {
     // 高さが不揃い（アイコン等）— ただし高信頼で読めた単語は正当な文字とみなす
     if ((wh > medH * 1.7 || wh < medH * 0.45) && wd.conf < 80) return true;
     if (wd.conf < 55 && chars.length <= 3) return true;   // 低信頼の短い断片
+    if (wd.conf < 70 && chars.length === 1) return true;  // 端の単独文字は飾りの誤認識が多い
     return false;
   };
   const out = [...words];
   while (out.length > 1 && isEdgeGarbage(out[0])) out.shift();
   while (out.length > 1 && isEdgeGarbage(out[out.length - 1])) out.pop();
+  // 「…ことで、と」のように句読点の直後に単独文字が付くのは葉っぱ等の誤認識が多い
+  if (out.length >= 2) {
+    const last = out[out.length - 1];
+    if ([...last.text].length === 1 && last.conf < 85 && /[、。]$/.test(out[out.length - 2].text)) out.pop();
+  }
   if (out.length === 1 && isEdgeGarbage(out[0])) return [];
   return out;
+}
+
+// 行頭・行末に残った記号ゴミ（" | ~ など）を取り除く
+const LEAD_STRIP_RE = /^[^぀-ヿ㐀-鿿0-9A-Za-z０-９Ａ-Ｚａ-ｚ「『（(]+/;
+const TAIL_STRIP_RE = /[^぀-ヿ㐀-鿿0-9A-Za-z０-９Ａ-Ｚａ-ｚ。、！？!?」』）)]+$/;
+function stripEdgeSymbols(t) {
+  return t.replace(LEAD_STRIP_RE, "").replace(TAIL_STRIP_RE, "");
 }
 
 // 単語を結合: 英数字の単語間と、目に見える隙間がある箇所に半角スペース。
@@ -536,11 +555,44 @@ function joinWords(words) {
 
 // 描画したとき元の幅からはみ出すならフォントサイズを縮める（レイアウト崩れ防止）
 const measureCtx = document.createElement("canvas").getContext("2d");
-function fitSizeToWidth(text, size, maxW) {
-  measureCtx.font = `400 ${size}px ${FONT_STACK}`;
+function fitSizeToWidth(text, size, maxW, bold) {
+  measureCtx.font = `${bold ? "700" : "400"} ${size}px ${FONT_STACK}`;
   const mw = measureCtx.measureText(text).width;
   if (mw > maxW * 1.05) size = Math.max(8, Math.floor(size * (maxW * 1.02) / mw));
   return size;
+}
+
+// 枠内で「実際に文字のインクが描かれている範囲」をピクセル単位で測る。
+// OCRの返すbboxは実際の文字より大きいことがあるため、
+// フォントサイズ・位置・太字判定はこの実測値を使う。
+function measureInk(fullImg, bb) {
+  const w = fullImg.width, h = fullImg.height;
+  const x0 = Math.max(0, bb.x0), y0 = Math.max(0, bb.y0);
+  const x1 = Math.min(w - 1, bb.x1), y1 = Math.min(h - 1, bb.y1);
+  if (x1 <= x0 || y1 <= y0) return null;
+  const px = (x, y) => {
+    const i = (y * w + x) * 4;
+    return [fullImg.data[i], fullImg.data[i + 1], fullImg.data[i + 2]];
+  };
+  const c1 = px(x0, y0), c2 = px(x1, y0), c3 = px(x0, y1), c4 = px(x1, y1);
+  const bg = [0, 1, 2].map(i => (c1[i] + c2[i] + c3[i] + c4[i]) / 4);
+  let ix0 = Infinity, iy0 = Infinity, ix1 = -1, iy1 = -1, n = 0;
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const p = px(x, y);
+      const d0 = p[0] - bg[0], d1 = p[1] - bg[1], d2 = p[2] - bg[2];
+      if (d0 * d0 + d1 * d1 + d2 * d2 > 5000) {
+        if (x < ix0) ix0 = x;
+        if (x > ix1) ix1 = x;
+        if (y < iy0) iy0 = y;
+        if (y > iy1) iy1 = y;
+        n++;
+      }
+    }
+  }
+  if (ix1 < 0 || iy1 - iy0 < 6) return null;
+  const ratio = n / ((ix1 - ix0 + 1) * (iy1 - iy0 + 1));
+  return { x0: ix0, y0: iy0, x1: ix1, y1: iy1, h: iy1 - iy0 + 1, ratio };
 }
 
 // 文字枠の周囲の背景が「平坦（単色〜ゆるやかなグラデーション）」かどうか。
@@ -823,7 +875,7 @@ window.addEventListener("resize", fitToWindow);
 window.__getState = () => ({
   ocrDone,
   blockCount: blocks.length,
-  blocks: blocks.map(b => ({ x: b.x, y: b.y, size: b.size, color: b.color, text: getBlockText(b) }))
+  blocks: blocks.map(b => ({ x: b.x, y: b.y, size: b.size, color: b.color, bold: b.bold, text: getBlockText(b) }))
 });
 </script>
 </body>
